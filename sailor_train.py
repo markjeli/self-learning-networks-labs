@@ -27,15 +27,6 @@ strategy = np.random.randint(
 random_strategy_mean_reward = np.mean(sf.sailor_test(reward_map, strategy, 1000))
 sf.draw(reward_map, strategy, "random_strategy mean reward = " + str(random_strategy_mean_reward))
 
-# miejsce na algorytm uczenia - modelem jest tablica Q
-# (symulację epizodu można wziąć z funkcji sailor_test())
-# ............................
-# Uzupełnić skrypt sailor_train tak, aby pozwalał znaleźć optymalną strategię
-# żeglarza w oparciu o tablicę użyteczności Q par (stan, akcja) i metodę symulacji
-# Monte Carlo dla zadanych przez prowadzącego plansz (map).
-# Należy porównać iterację strategii i iterację wartości pod kątem
-# złożoności obliczeniowej i stabilności.
-
 # Generate all possible state-action pairs
 actions = [1, 2, 3, 4]
 state_action_pairs = []
@@ -81,6 +72,47 @@ while True:
 
     if np.array_equal(strategy, strategy_temp):
         break
+sf.sailor_test(reward_map, strategy, 1000)
+sf.draw(reward_map, strategy, "best_strategy1")
+
+# Monte Carlo Iteration Value
+alpha = lambda n: 1 / (n + 1)
+for _ in range(number_of_episodes):
+    for state_action_pair in state_action_pairs:
+        state = np.array(state_action_pair[0])
+        action = state_action_pair[1]
+        the_end = True if (state[1] >= num_of_columns - 1) else False
+        rewards = []
+        nr_pos = 0
+        reward = 0
+        while the_end == False:
+            nr_pos = nr_pos + 1
+            state_next, reward = sf.environment(state, action, reward_map)
+            rewards.append(reward)
+            state = state_next
+            action = np.argmax(Q[state[0], state[1]]) + 1
+            if (nr_pos == num_of_steps_max) | (state[1] >= num_of_columns - 1):
+                the_end = True
+
+        rewards_sum = sum([gamma**i * r for i, r in enumerate(rewards)])
+        Q[
+            state_action_pair[0][0], state_action_pair[0][1], state_action_pair[1] - 1
+        ] = (
+            (1 - alpha(nr_pos))
+            * Q[
+                state_action_pair[0][0],
+                state_action_pair[0][1],
+                state_action_pair[1] - 1,
+            ]
+            + (alpha(nr_pos) * rewards_sum)
+        )
+
+for x in range(num_of_rows):
+    for y in range(num_of_columns):
+        if y < num_of_columns - 1:
+            strategy[x, y] = np.argmax(Q[x, y]) + 1
+        else:
+            strategy[x, y] = 0
 
 sf.sailor_test(reward_map, strategy, 1000)
-sf.draw(reward_map, strategy, "best_strategy")
+sf.draw(reward_map, strategy, "best_strategy2")
