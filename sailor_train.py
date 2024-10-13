@@ -35,10 +35,47 @@ sf.draw(
     "random_strategy mean reward = " + str(random_strategy_mean_reward),
 )
 
+# Monte Carlo Iteration Strategy with Dynamic Programming
+delta_max = 0.0001
+iteration = 0
+while True:
+    delta = delta_max
+    V = np.zeros([num_of_rows, num_of_columns], dtype=float)
+    strategy_temp = strategy.copy()
 
-# miejsce na algorytm uczenia - modelem jest tablica Q
-# (symulację epizodu można wziąć z funkcji sailor_test())
-# ............................
+    while delta >= delta_max:
+        V_temp = V.copy()
+        delta = 0
+
+        for i in range(num_of_rows):
+            for j in range(num_of_columns):
+                if j < num_of_columns - 1:
+                    action = strategy[i, j]
+                    state = np.array([i, j])
+                    transitions = sf.transition_probabilities(state, action, reward_map)
+                    V[i, j] = sf.mean_reward(state, action, reward_map) + gamma * sum(
+                        p * V_temp[s_new[0], s_new[1]] for s_new, p in transitions
+                    )
+                    delta = max(delta, abs(V[i, j] - V_temp[i, j]))
+
+    for i in range(num_of_rows):
+        for j in range(num_of_columns):
+            if j < num_of_columns - 1:
+                action_values = np.zeros(4)
+                for action in range(1, 5):
+                    state = np.array([i, j])
+                    transitions = sf.transition_probabilities(state, action, reward_map)
+                    action_values[action - 1] = sf.mean_reward(
+                        state, action, reward_map
+                    ) + gamma * sum(p * V[s_new[0], s_new[1]] for s_new, p in transitions)
+                strategy[i, j] = np.argmax(action_values) + 1
+            else:
+                strategy[i, j] = 0
+
+    iteration += 1
+    print(f"Iteration {iteration}")
+    if np.array_equal(strategy, strategy_temp):
+        break
 
 
 sf.sailor_test(reward_map, strategy, 1000)

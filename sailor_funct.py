@@ -116,6 +116,69 @@ def environment(state, action, reward_map):
 
     return state_new, reward
 
+def transition_probabilities(state, action, reward_map):
+    num_of_rows, num_of_columns = reward_map.shape
+    prob_side = 0.17
+    prob_back = 0.04
+    prob_forward = 1 - (2 * prob_side + prob_back)
+    transitions = []
+
+    actions = {
+        1: (0, 1), # right
+        2: (-1, 0), # up
+        3: (0, -1), # left
+        4: (1, 0) # down
+    }
+
+    action_probs = {
+        1: [(3, prob_back), (2, prob_side), (4, prob_side), (1, prob_forward)],
+        2: [(4, prob_back), (1, prob_side), (3, prob_side), (2, prob_forward)],
+        3: [(1, prob_back), (2, prob_side), (4, prob_side), (3, prob_forward)],
+        4: [(2, prob_back), (1, prob_side), (3, prob_side), (4, prob_forward)]
+    }
+
+    for act, prob in action_probs[action]:
+        state_new = state + np.array(actions[act])
+        if 0 <= state_new[0] < num_of_rows and 0 <= state_new[1] < num_of_columns:
+            transitions.append((state_new, prob))
+        else:
+            transitions.append((state, prob))
+
+    return transitions
+
+def mean_reward(state, action, reward_map) -> float:
+    num_of_rows, num_of_columns = reward_map.shape
+    prob_side = 0.17
+    prob_back = 0.04
+    prob_forward = 1 - (2 * prob_side + prob_back)
+    wall_colid_reward = -0.4
+
+    actions = {
+        1: (0, 1),  # right
+        2: (-1, 0),  # up
+        3: (0, -1),  # left
+        4: (1, 0)  # down
+    }
+
+    action_probs = {
+        1: [(3, prob_back), (2, prob_side), (4, prob_side), (1, prob_forward)],
+        2: [(4, prob_back), (1, prob_side), (3, prob_side), (2, prob_forward)],
+        3: [(1, prob_back), (2, prob_side), (4, prob_side), (3, prob_forward)],
+        4: [(2, prob_back), (1, prob_side), (3, prob_side), (4, prob_forward)]
+    }
+
+    reward = 0
+
+    for act, prob in action_probs[action]:
+        state_new = state + np.array(actions[act])
+        if 0 <= state_new[0] < num_of_rows and 0 <= state_new[1] < num_of_columns:
+            reward += prob * reward_map[state_new[0], state_new[1]]
+        else:
+            reward += prob * wall_colid_reward
+
+    return reward
+
+
 # test for given number of episodes - pure exploration
 # higher number of episodes gives higher precision
 def sailor_test(reward_map, strategy, num_of_episodes):
