@@ -196,5 +196,22 @@ def draw(reward_map, strategy, title):
     plt.show()
     f.savefig(title + '.svg')
 
+def epsilon_greedy(state, Q, epsilon):
+    if np.random.rand() < epsilon:
+        return np.random.randint(1, 5)
+    else:
+        return 1 + np.argmax(Q[state[0], state[1], :])
 
-   
+def get_alpha(episode, num_of_episodes, map_size):
+    initial_alpha = 1.0
+    min_alpha = 0.01
+    decay_rate = map_size / num_of_episodes
+    alpha = initial_alpha * np.exp(-decay_rate * episode)
+    return max(alpha, min_alpha)
+
+def get_epsilon(episode, num_of_episodes, map_size):
+    initial_epsilon = 1.0
+    min_epsilon = 0.1
+    decay_rate = map_size / num_of_episodes
+    epsilon = initial_epsilon * np.exp(-decay_rate * episode)
+    return max(epsilon, min_epsilon)
