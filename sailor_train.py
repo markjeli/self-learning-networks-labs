@@ -8,10 +8,10 @@ import sailor_funct as sf
 number_of_episodes = 10000  # number of training episodes (multi-stage processes)
 gamma = 1.0  # discount factor
 
-# file_name = "map_small.txt"
-file_name = "map_easy.txt"
-# file_name = 'map_big.txt'
-# file_name = 'map_spiral.txt'
+file_name = 'map_simple.txt'
+#file_name = 'map_easy.txt'
+#file_name = 'map_big.txt'
+#file_name = 'map_spiral.txt'
 
 reward_map = sf.load_data(file_name)
 num_of_rows, num_of_columns = reward_map.shape
@@ -28,7 +28,7 @@ strategy = np.random.randint(
     low=1, high=5, size=np.shape(reward_map)
 )  # random strategy
 random_strategy_mean_reward = np.mean(sf.sailor_test(reward_map, strategy, 1000))
-sf.draw(
+sf.draw_strategy(
     reward_map,
     strategy,
     "random_strategy mean reward = " + str(random_strategy_mean_reward),
@@ -59,4 +59,4 @@ for episode in range(number_of_episodes):
 strategy = sf.strategy(Q)
 
 sf.sailor_test(reward_map, strategy, 1000)
-sf.draw(reward_map, strategy, "best_strategy")
+sf.draw_strategy(reward_map, strategy, "best_strategy")
