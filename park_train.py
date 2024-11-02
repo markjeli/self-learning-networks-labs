@@ -1,58 +1,83 @@
 import numpy as np
 import parking_model as pm
 from tqdm import tqdm
+from numba import njit
 
 iht_size = 4096  # Rozmiar tablicy kodowania (tile coding)
 num_tilings = 8  # Liczba pokryć
 tile_size = [
-    0.1,
-    0.1,
+    0.2,
+    0.2,
     np.pi / 8,
-    0.05,
-    0.1,
+    np.pi / 8,
+    0.5,
 ]  # Rozmiar kafelka dla (x, y, kąt, kąt skrętu, prędkość)
 offsets = [
     (i / num_tilings) * np.array(tile_size) for i in range(num_tilings)
 ]  # Przesunięcia dla każdego pokrycia
 
 
-# przykładowa nagroda za krok - nie wiem czy dobra
-def nagroda_za_krok(param_fiz, stan, czy_kolizja, czy_zatrzymanie):
-    # tutaj należy ustalić nagrodę za każdy krok, tak by uczenie podążało
-    # we właściwym kierunku:
-    # ........................................
-    # ........................................
+# # przykładowa nagroda za krok - nie wiem czy dobra
+# def nagroda_za_krok(param_fiz, stan, czy_kolizja, czy_zatrzymanie):
+#     wartosc = 0
+#     x = stan[0]
+#     y = stan[1]
+#     alfa = stan[2]
+#     odl_xy_kw = x * x + y * y
+#     alfa_zred = 0
+#     if param_fiz.if_side_parking_place:
+#         if np.abs(alfa) > np.pi / 2:
+#             alfa_zred = np.pi - np.abs(alfa)
+#         else:
+#             alfa_zred = np.abs(alfa)
+#     else:
+#         alfa_zred = np.abs(np.abs(alfa) - np.pi / 2)
+#
+#     alfa_zred = alfa_zred / (odl_xy_kw + 0.5)
+#
+#     ocena_odl = 1 / (odl_xy_kw + 0.5) - 1
+#     ocena_alfa = alfa_zred - 0.5
+#
+#     # jeśli V==0 nagroda na podstawie odległości
+#
+#     if czy_kolizja:
+#         wartosc = -1
+#     elif czy_zatrzymanie:
+#         wartosc = min(ocena_odl, ocena_alfa)
+#     else:
+#         wartosc = 0
+#
+#     return wartosc
 
-    # przykładowe obliczenie nagrody za krok - nie wiem czy dobre:
-    wartosc = 0
-    x = stan[0]
-    y = stan[1]
-    alfa = stan[2]
-    odl_xy_kw = x * x + y * y
-    alfa_zred = 0
-    if param_fiz.if_side_parking_place:
-        if np.abs(alfa) > np.pi / 2:
-            alfa_zred = np.pi - np.abs(alfa)
-        else:
-            alfa_zred = np.abs(alfa)
-    else:
-        alfa_zred = np.abs(np.abs(alfa) - np.pi / 2)
 
-    alfa_zred = alfa_zred / (odl_xy_kw + 0.5)
+def nagroda_za_krok(param_fiz, stan, czy_kolizja, krok):
+    x, y, alfa = stan
+    odl_xy = np.sqrt(x**2 + y**2)
 
-    ocena_odl = 1 / (odl_xy_kw + 0.5) - 1
-    ocena_alfa = alfa_zred - 0.5
+    # Normalize the angle to be within [0, pi] range
+    alfa = np.abs(alfa % (2 * np.pi))
+    if alfa > np.pi:
+        alfa = 2 * np.pi - alfa
+    if alfa > np.pi / 2:
+        alfa = np.pi - alfa
 
-    # jeśli V==0 nagroda na podstawie odległości
+    # Calculate the distance and angle penalties
+    distance_penalty = odl_xy
+    angle_penalty = alfa / np.pi
 
+    # Calculate the step penalty if the number of steps exceeds the rational number
+    rational_num_of_steps = (
+        param_fiz.park_depth + param_fiz.street_width + param_fiz.street_length
+    ) / (param_fiz.Vmod * param_fiz.dt)
+    step_penalty = max(krok - rational_num_of_steps, 0) / rational_num_of_steps
+
+    # Calculate the reward
     if czy_kolizja:
-        wartosc = -1
-    elif czy_zatrzymanie:
-        wartosc = min(ocena_odl, ocena_alfa)
+        reward = -1
     else:
-        wartosc = 0
+        reward = -(distance_penalty + angle_penalty + step_penalty)
 
-    return wartosc
+    return reward
 
 
 def choose_action(param_fiz, stan, model):
@@ -61,24 +86,22 @@ def choose_action(param_fiz, stan, model):
     # ..........................................
     # ..........................................
     # Eksploatacja: wybór najlepszej akcji
-    best_action = None
-    best_value = -np.inf
-    for _ in range(100):  # Przeszukujemy przestrzeń akcji
-        action = [
-            np.random.uniform(-param_fiz.wheel_turn_angle_max, param_fiz.wheel_turn_angle_max),
-            np.random.uniform(-param_fiz.Vmod, param_fiz.Vmod),
-        ]
-        value = Q_value(stan, action, model)
-        if value > best_value:
-            best_value = value
-            best_action = action
+    actions = [
+        [angle, speed]
+        for angle in np.arange(
+            -param_fiz.wheel_turn_angle_max,
+            param_fiz.wheel_turn_angle_max + np.pi / 8,
+            np.pi / 8,
+        )
+        for speed in np.arange(-param_fiz.Vmod, param_fiz.Vmod + 0.5, 0.5)
+    ]
+    q_values = np.array([Q_value(stan, action, model) for action in actions])
+    best_action = actions[np.argmax(q_values)]
     action = best_action
 
-    # kat = -np.pi / 8  # jakiś kąt skrętu kół (na razie)
-    # V = -param_fiz.Vmod  # jakaś prędkość (na razie)
-    kat = action[0]
-    V = action[1]
-    czy_zatrzymanie = False  # na razie (można przyjąć True np. gdy |V| < próg)
+    kat, V = action
+    # czy_zatrzymanie = False  # na razie (można przyjąć True np. gdy |V| < próg)
+    czy_zatrzymanie = np.abs(V) < 0.1
     return kat, V, czy_zatrzymanie
 
 
@@ -131,35 +154,45 @@ def park_test(param_fiz, stany_poczatkowe, model, nazwa_pliku):
 
 
 # Funkcja do generowania unikalnych indeksów kafelków
+@njit
 def tile_hash(indices, iht_size):
     return sum([index * (i + 1) for i, index in enumerate(indices)]) % iht_size
 
 
-# Funkcja do kodowania (stan + akcja) przy pomocy niestandardowego tile coding
 def get_tiles(state, action, iht_size=4096):
-    tile_indices = []
-    combined_state_action = np.concatenate((state, action), axis=0)  # Łączymy stan i akcję
+    tile_vector = np.zeros(iht_size)  # Binarna tablica o rozmiarze iht_size
+    combined_state_action = np.concatenate(
+        (state, action), axis=0
+    )  # Łączymy stan i akcję
 
     for offset in offsets:
-        # Przesunięcie w każdym pokryciu, podział przez tile_size, zaokrąglenie w dół
+        # Obliczamy indeks kafelka dla danej przesuniętej kombinacji stan+akcja
         tile_index = np.floor((combined_state_action + offset) / tile_size).astype(int)
-        # Hashowanie indeksu kafelka, aby uzyskać unikalny integer
-        tile_indices.append(tile_hash(tile_index, iht_size))
+        # Hashujemy indeks kafelka i ustawiamy go na 1 w binarnej tablicy
+        index = tile_hash(tile_index, iht_size)
+        tile_vector[index] = 1  # Aktywujemy kafelek w tablicy
 
-    return tile_indices
+    return tile_vector
 
 
-# Funkcja Q
 def Q_value(state, action, weights):
-    # Obliczamy wartość Q jako sumę aktywnych wag
-    features = get_tiles(state, action)
-    return sum(weights[f] for f in features)
+    features = get_tiles(
+        state, action
+    )  # Otrzymujemy binarną tablicę aktywnych kafelków
+    return np.dot(features, weights)  # Mnożenie macierzy, aby uzyskać wartość Q
 
 
 # Wybór akcji z polityką epsilon-greedy
 def epsilon_greedy_policy(state, weights, epsilon):
     wheel_turn_angle_max = np.pi / 4
     Vmod = 2
+    actions = [
+        [angle, speed]
+        for angle in np.arange(
+            -wheel_turn_angle_max, wheel_turn_angle_max + np.pi / 8, np.pi / 8
+        )
+        for speed in np.arange(-Vmod, Vmod + 0.5, 0.5)
+    ]
     if np.random.rand() < epsilon:
         # Eksploracja: losowy wybór akcji
         action = [
@@ -168,23 +201,32 @@ def epsilon_greedy_policy(state, weights, epsilon):
         ]  # Przykład zakresów
     else:
         # Eksploatacja: wybór najlepszej akcji
-        best_action = None
-        best_value = -np.inf
-        for _ in range(100):  # Przeszukujemy przestrzeń akcji
-            action = [
-                np.random.uniform(-wheel_turn_angle_max, wheel_turn_angle_max),
-                np.random.uniform(-Vmod, Vmod),
-            ]
-            value = Q_value(state, action, weights)
-            if value > best_value:
-                best_value = value
-                best_action = action
+        q_values = np.array([Q_value(state, action, weights) for action in actions])
+        best_action = actions[np.argmax(q_values)]
         action = best_action
     return action
 
 
+def update_weights(
+    weights, state, action, reward, next_state, next_action, gamma, alpha
+):
+    # Obliczamy wektor funkcji cech dla stanu i akcji oraz kolejnego stanu i akcji
+    current_features = get_tiles(state, action)  # Binarna tablica dla (s, a)
+    next_features = get_tiles(next_state, next_action)  # Binarna tablica dla (s', a')
+
+    # Obliczamy wartość Q dla obecnego stanu i akcji oraz kolejnego stanu i akcji
+    current_Q = np.dot(current_features, weights)
+    next_Q = np.dot(next_features, weights)
+
+    # Obliczamy błąd TD
+    td_error = reward + gamma * next_Q - current_Q
+
+    # Aktualizacja wag: wagi = wagi + α * błąd TD * cechy
+    weights += alpha * td_error * current_features
+
+
 def park_train():
-    liczba_epizodow = 200
+    liczba_epizodow = 2000
     alpha = 0.001  # wsp.szybkosci uczenia(moze byc funkcja czasu)
     epsilon = 0.1  # wsp.eksploracji(moze byc funkcja czasu)
     gamma = 0.99  # Czynnik dyskontujący
@@ -233,14 +275,6 @@ def park_train():
     liczba_stanow_poczatkowych, lparam = stany_poczatkowe.shape
 
     param_fiz = pm.GlobalVar()  # parametry fizyczne parkingu i pojazdu
-
-    # inicjacja kodowania, wyznaczenie liczby parametrów (wag):
-    # ........................................................
-    # ........................................................
-
-    # Parametry kodowania i aproksymacji
-
-
     # Inicjalizujemy wagi
     weights = np.zeros(iht_size)
 
@@ -255,33 +289,25 @@ def park_train():
         while czy_zatrzymanie == False:
             krok = krok + 1
 
-            # Wyznaczamy akcje a (kąt + kier. ruchu) w stanie stan z uwzględnieniem
-            # eksploracji (np. metoda epsylon-zachlanna lub softmax lub jeszcze inna)
-            # ........................................................
-            # ........................................................
             action = epsilon_greedy_policy(state, weights, epsilon)
-            angle = action[0]
-            V = action[1]
+            angle, V = action
 
             # wyznaczenie nowego stanu:
-            next_state, sr_obrotu, czy_kolizja = pm.model_of_car(param_fiz, state, angle, V)
+            next_state, sr_obrotu, czy_kolizja = pm.model_of_car(
+                param_fiz, state, angle, V
+            )
 
-            if (czy_kolizja) | (krok >= param_fiz.max_number_of_steps):
+            if czy_kolizja or (krok >= param_fiz.max_number_of_steps):
                 czy_zatrzymanie = True
 
-            reward = nagroda_za_krok(param_fiz, next_state, czy_kolizja, czy_zatrzymanie)
-
-            # Aktualizujemy wartosci Q dla aktualnego stanu i wybranej akcji:
-            # ........................................................
-            # ........................................................
-            # w = w + ...
+            # reward = nagroda_za_krok(
+            #     param_fiz, next_state, czy_kolizja, czy_zatrzymanie
+            # )
+            reward = nagroda_za_krok(param_fiz, next_state, czy_kolizja, krok)
             next_action = epsilon_greedy_policy(next_state, weights, epsilon)
-            features = get_tiles(state, action)
-            next_Q = Q_value(next_state, next_action, weights)
-            current_Q = Q_value(state, action, weights)
-            td_error = reward + gamma * next_Q - current_Q
-            for f in features:
-                weights[f] += alpha * td_error
+            update_weights(
+                weights, state, action, reward, next_state, next_action, gamma, alpha
+            )
 
             state = next_state
 
