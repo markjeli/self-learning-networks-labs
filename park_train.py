@@ -1,32 +1,19 @@
 import numpy as np
-
+import random
+from sklearn.cluster import KMeans
 import parking_model as pm
 from tqdm import tqdm
-from numba import njit
+import matplotlib.pyplot as plt
 
 # Global Variables
 GLOBAL_VARS = pm.GlobalVar()
 
 ## Training Hyperparameters
-ALPHA = 0.002
-EPSILON = 1.0
+ALPHA = 0.005  # Współczynnik uczenia
+EPSILON = 1.0  # Parametr eksploracji
 gamma = 0.90  # Czynnik dyskontujący
 
-number_of_episodes = 5000
-
-## Tiles
-iht_size = 8192  # Rozmiar tablicy kodowania (tile coding)
-num_tilings = 8  # Liczba pokryć
-tile_size = [
-    0.1,
-    0.1,
-    np.pi / 8,
-    np.pi / 8,
-    0.5,
-]  # Rozmiar kafelka dla (x, y, kąt, kąt skrętu, prędkość)
-offsets = [
-    (i / num_tilings) * np.array(tile_size) for i in range(num_tilings)
-]  # Przesunięcia dla każdego pokrycia
+number_of_episodes = 1000
 
 ## Actions
 PREDEFINED_ACTIONS = [
@@ -39,11 +26,144 @@ PREDEFINED_ACTIONS = [
     for speed in np.arange(-GLOBAL_VARS.Vmod, GLOBAL_VARS.Vmod + 1, 1)
     if not speed == 0
 ]
+# PREDEFINED_ACTIONS = [
+#     [angle, speed]
+#     for angle in np.linspace(
+#         -GLOBAL_VARS.wheel_turn_angle_max, GLOBAL_VARS.wheel_turn_angle_max, 10
+#     )  # Limit steering angles
+#     for speed in [-1.0, 1.0]  # Simplify to forward/backward
+# ]
 PREDEFINED_ACTIONS.append([0, 0])
+
+## Prototypes
+# Define ranges for x, y, and angle
+x_range = np.arange(
+    -GLOBAL_VARS.street_length / 2,
+    GLOBAL_VARS.street_length / 2 + 1,
+    # 1,
+    GLOBAL_VARS.street_length / 2,
+)  # [-13, 0, 13]
+y_range = np.arange(
+    GLOBAL_VARS.car_width / 2,
+    GLOBAL_VARS.street_width + GLOBAL_VARS.car_width / 2 + 1,
+    # 1,
+    GLOBAL_VARS.street_width / 2,
+)  # [1.15, 4.65, 8.15]
+angle_range = np.arange(
+    -np.pi,
+    np.pi + np.pi / 2,
+    # np.pi / 4,
+    np.pi / 2,
+)  # [-pi, -pi/2, 0, pi/2, pi]
+
+# Generate prototype states
+PROTOTYPE_POSITIONS = [
+    [x, y, angle] for x in x_range for y in y_range for angle in angle_range
+]
+
+# Definiujemy prototypy akcji (np. różne kąty skrętu i prędkości)
+PROTOTYPE_ACTIONS = [
+    [-np.pi / 4, 1],
+    [0, 1],
+    [np.pi / 4, -1],
+    [0, -1],
+    [0, 0],
+]
+
+
+def generate_states_near_parking(num_states, parking_center):
+    states = []
+    angles = np.arange(-np.pi, np.pi + np.pi / 4, np.pi / 4)
+    for _ in range(num_states):
+        x = parking_center[0] + np.random.uniform(
+            -GLOBAL_VARS.place_width / 2, GLOBAL_VARS.place_width / 2
+        )
+        y = parking_center[1] + np.random.uniform(
+            -GLOBAL_VARS.car_width / 2, GLOBAL_VARS.car_width / 2
+        )
+        angle = np.random.choice(angles)
+        states.append([x, y, angle])
+    return states
+
+
+def initialize_prototypes(prototype_positions, prototype_actions):
+    # Generate states near the parking slot
+    near_parking_states = generate_states_near_parking(
+        num_states=50, parking_center=[0, 0]
+    )
+
+    # Combine predefined positions and near parking states
+    all_positions = prototype_positions + near_parking_states
+
+    # Create all possible combinations of states and actions
+    prototypes = [
+        [pos[0], pos[1], pos[2], action[0], action[1]]
+        for pos in all_positions
+        for action in prototype_actions
+    ]
+    return np.array(prototypes)
+
+
+def initialize_prototypes_dynamic(
+    prototype_positions, prototype_actions, n_clusters=200
+):
+    # Create all possible state-action combinations
+    # Generate states near the parking slot
+    near_parking_states = generate_states_near_parking(
+        num_states=50, parking_center=[0, 0]
+    )
+
+    # Combine predefined positions and near parking states
+    all_positions = prototype_positions + near_parking_states
+
+    prototypes = np.array(
+        [
+            [pos[0], pos[1], pos[2], action[0], action[1]]
+            for pos in all_positions
+            for action in prototype_actions
+        ]
+    )
+
+    # Use KMeans to cluster prototypes dynamically
+    kmeans = KMeans(n_clusters=n_clusters).fit(prototypes) # , random_state=42
+    clustered_prototypes = kmeans.cluster_centers_
+
+    return clustered_prototypes
+
+
+# Inicjalizujemy prototypy jako kombinacje stanów i akcji
+PROTOTYPES = initialize_prototypes(PROTOTYPE_POSITIONS, PREDEFINED_ACTIONS)
+# PROTOTYPES = initialize_prototypes_dynamic(PROTOTYPE_POSITIONS, PREDEFINED_ACTIONS)
+
+prototype_positions = [
+    [0, 0, 0],  # Stan 1
+    [-10, 0, 0],  # Stan 2
+    # [0, 10, np.pi/2],  # Stan 3
+    # [10, 10, np.pi],   # Stan 4
+    # [5, 5, np.pi/4]    # Stan 5
+]
+
+# Definiujemy prototypy akcji (np. różne kąty skrętu i prędkości)
+prototype_actions = [
+    [-np.pi / 4, 1],  # Akcja 1
+    [0, 1],  # Akcja 2
+    [np.pi / 4, -1],  # Akcja 3
+    [0, -1],  # Akcja 4
+    [0, 0],  # Akcja 5
+]
+
+# PROTOTYPES = initialize_prototypes(prototype_positions, PREDEFINED_ACTIONS)
 
 ## Batching
 BATCH_SIZE = 10
 experience_buffer = []
+
+## Cache
+cached_features = []
+
+## Logging
+episode_rewards = []
+episode_steps = []
 
 
 # przykładowa nagroda za krok - nie wiem czy dobra
@@ -75,142 +195,71 @@ def nagroda_za_krok(param_fiz, stan, czy_kolizja, czy_zatrzymanie):
     return wartosc
 
 
-def nagroda_za_krok2(state, last_state, num_of_steps, if_collision, if_stopped):
-    goal_tolerance = 0.2
-    angle_tolerance = np.radians(5)
+def reward_function(state, last_state, if_collision, if_stopped):
     x, y, angle = state
-    last_x, last_y = last_state[:2]
+    last_x, last_y, last_angle = last_state
 
-    # Calculate distances
-    distance = np.sqrt(x**2 + y**2)
-    last_distance = np.sqrt(last_x**2 + last_y**2)
+    # Distance to goal (0, 0)
+    distance_to_goal = np.sqrt(x**2 + y**2)
+    last_distance_to_goal = np.sqrt(last_x**2 + last_y**2)
 
-    # Reward for moving closer to the parking slot
-    progress_reward = 1 if distance < last_distance else -1
+    # Angle error (aligning to goal orientation)
+    angle_error = min(abs(angle), abs(abs(angle) - np.pi))
 
-    # Large reward for achieving the final parking position and orientation
-    final_parked_reward = (
-        100 if distance < goal_tolerance and abs(angle) < angle_tolerance else 0
-    )
+    # Reward for reducing distance
+    progress_reward = max(0, last_distance_to_goal - distance_to_goal)
 
-    # Penalty for excessive steps
-    rational_num_of_steps = (
-        GLOBAL_VARS.park_depth + GLOBAL_VARS.street_width + GLOBAL_VARS.street_length
-    ) / (GLOBAL_VARS.Vmod * GLOBAL_VARS.dt)
-    excess_step_penalty = -5 if num_of_steps > rational_num_of_steps else 0
-
-    # Penalty for minimal progress
-    position_change = np.sqrt((x - last_x) ** 2 + (y - last_y) ** 2)
-    orientation_change = abs(angle - last_state[2])
-    minimal_change_penalty = -1 if position_change < 0.01 and orientation_change < np.radians(1) else 0
-
-    # Penalty if car stops prematurely
-    stopped_penalty = -10 if if_stopped and distance > goal_tolerance else 0
-
-    # Reward for correct angle orientation
-    angle_reduced = (
-        abs(angle) if GLOBAL_VARS.if_side_parking_place else abs(abs(angle) - np.pi / 2)
-    )
-    angle_reward = 2 / (1 + angle_reduced * 5)
+    # Angle alignment reward (smoothed with cosine)
+    angle_alignment_reward = np.cos(angle_error)
 
     # Collision penalty
-    collision_penalty = -50 if if_collision else 0
+    collision_penalty = -50.0 if if_collision else 0
 
-    # Exploration bonus for new movements
-    exploration_reward = 0.1 if position_change > 0.01 or orientation_change > np.radians(1) else 0
-
-    # Combine all components
-    total_reward = (
-        progress_reward
-        + final_parked_reward
-        + excess_step_penalty
-        + minimal_change_penalty
-        + stopped_penalty
-        + angle_reward
-        + collision_penalty
-        + exploration_reward
-    )
-
-    return total_reward
-
-def nagroda_za_krok3(state, last_state, num_of_steps, if_collision, if_stopped, last_speed):
-    goal_tolerance = 0.2
+    # Stopping reward
+    stopping_reward = 0
+    goal_tolerance = 1
     angle_tolerance = np.radians(5)
-    x, y, angle = state
-    last_x, last_y = last_state[:2]
+    if (
+        if_stopped
+        and distance_to_goal < goal_tolerance
+        and angle_error < angle_tolerance
+    ):
+        stopping_reward = 10.0
 
-    # Calculate distances
-    distance = np.sqrt(x**2 + y**2)
-    last_distance = np.sqrt(last_x**2 + last_y**2)
-
-    # Reward for moving closer to the parking slot
-    progress_reward = 1 if distance < last_distance else -1
-
-    # Large reward for achieving the final parking position and orientation
-    final_parked_reward = 200 if distance < goal_tolerance and abs(angle) < angle_tolerance else 0
-
-    # Penalty for excessive steps
-    rational_num_of_steps = (
-        GLOBAL_VARS.park_depth + GLOBAL_VARS.street_width + GLOBAL_VARS.street_length
-    ) / (GLOBAL_VARS.Vmod * GLOBAL_VARS.dt)
-    excess_step_penalty = -5 if num_of_steps > rational_num_of_steps else 0
-
-    # Penalty if car stops prematurely
-    stopped_penalty = -10 if if_stopped and distance > goal_tolerance else 0
-
-    # Reward for correct angle orientation
-    angle_reduced = (
-        abs(angle) if GLOBAL_VARS.if_side_parking_place else abs(abs(angle) - np.pi / 2)
-    )
-    angle_reward = 2 / (1 + angle_reduced * 5)
-
-    # Collision penalty
-    collision_penalty = -50 if if_collision else 0
-
-    # Oscillation penalty for frequent speed changes
-    oscillation_penalty = -5 if np.sign(state[1]) != np.sign(last_speed) else 0
-
-    # Penalty for selecting the [0, 0] action in early training steps
-    zero_action_penalty = -10 if (state == [0, 0]) and (distance > goal_tolerance) else 0
-
-    # Combine all components
-    total_reward = (
-        progress_reward
-        + final_parked_reward
-        + excess_step_penalty
-        + stopped_penalty
-        + angle_reward
+    # Combine rewards
+    reward = (
+        0.8 * progress_reward
+        + 0.2 * angle_alignment_reward
+        + stopping_reward
         + collision_penalty
-        + oscillation_penalty
-        + zero_action_penalty
     )
+    return reward
 
-    return total_reward
+
+def reward_function2(state, if_collision, if_stopped):
+    distance_to_goal = np.sqrt(state[0] ** 2 + state[1] ** 2)
+    angle_error = min(abs(state[2]), abs(abs(state[2]) - np.pi))
+
+    distance_reward = -np.clip(distance_to_goal, 0, 1)
+    angle_reward = np.cos(angle_error)
+
+    if if_collision:
+        return -1.0
+    elif if_stopped:
+        return distance_reward + angle_reward
+    else:
+        return 0.1 * distance_reward  # Gradual reward for progress
 
 
-def reward_function(state, collision, step, czy_zatrzymanie):
-    distance_threshold = 0.1  # Maksymalna odległość uznawana za zaparkowanie
-    collision_penalty = -100
-    excess_step_penalty = -0.05  # Kara za każdy krok powyżej max_steps
+def check_if_stopped(state) -> bool:
     x, y, angle = state
-    distance = np.sqrt(x**2 + y**2)
-    distance_reward = max(0, 1 - 5 * distance / distance_threshold)
+    distance_to_goal = np.sqrt(x**2 + y**2)
+    angle_error = min(abs(angle), abs(abs(angle) - np.pi))
 
-    angle_tolerance = np.pi / 18
-    orientation_error = min(
-        abs(angle), abs(np.pi - abs(angle))
-    )  # Bierzemy pod uwagę kąt względem 0 lub 180
-    orientation_reward = 1 if orientation_error < angle_tolerance else 0
+    goal_tolerance = 1
+    angle_tolerance = np.radians(5)
 
-    if collision:
-        return collision_penalty
-
-    # Kara za nadmierną liczbę kroków
-    max_steps = 100
-    step_penalty = -0.01 + (excess_step_penalty * max(0, step - max_steps))
-
-    total_reward = distance_reward + orientation_reward + step_penalty
-    return total_reward
+    return distance_to_goal < goal_tolerance and angle_error < angle_tolerance
 
 
 def choose_action(state, weights, param_fiz=GLOBAL_VARS):
@@ -221,7 +270,7 @@ def choose_action(state, weights, param_fiz=GLOBAL_VARS):
     action = best_action
 
     angle, V = action
-    if_stopped = V == 0
+    if_stopped = check_if_stopped(state) or V == 0
     return angle, V, if_stopped
 
 
@@ -273,70 +322,58 @@ def park_test(param_fiz, stany_poczatkowe, model, nazwa_pliku):
     return sr_ocena_koncowa
 
 
-# Funkcja do generowania unikalnych indeksów kafelków
-@njit
-def tile_hash(indices, iht_size):
-    return sum([index * (i + 1) for i, index in enumerate(indices)]) % iht_size
+def encode_prototype(state, action):
+    k = 1
+    # Łączenie stanu i akcji w jeden wektor
+    state_action = np.concatenate((state, action), axis=0)  # Łączymy stan i akcję
 
+    # Obliczanie odległości euklidesowych między stanem-akcją a każdym prototypem
+    distances = np.linalg.norm(PROTOTYPES - state_action, axis=1)
 
-def get_tiles(state, action, iht_size=iht_size):
-    tile_vector = np.zeros(iht_size)  # Binarna tablica o rozmiarze iht_size
-    combined_state_action = np.concatenate(
-        (state, action), axis=0
-    )  # Łączymy stan i akcję
+    # Znajdź indeksy `k` najbliższych prototypów
+    nearest_indices = np.argpartition(distances, k)[:k]
 
-    for offset in offsets:
-        # Obliczamy indeks kafelka dla danej przesuniętej kombinacji stan+akcja
-        tile_index = np.floor((combined_state_action + offset) / tile_size).astype(int)
-        # Hashujemy indeks kafelka i ustawiamy go na 1 w binarnej tablicy
-        index = tile_hash(tile_index, iht_size)
-        tile_vector[index] = 1  # Aktywujemy kafelek w tablicy
+    # Tworzenie wektora binarnego 0 i 1
+    encoding = np.zeros(len(PROTOTYPES), dtype=int)
+    encoding[nearest_indices] = 1
 
-    return tile_vector
+    return encoding
 
 
 def Q_value(state, action, weights):
-    features = get_tiles(
+    features = encode_prototype(
         state, action
     )  # Otrzymujemy binarną tablicę aktywnych kafelków
     return np.dot(features, weights)  # Mnożenie macierzy, aby uzyskać wartość Q
 
 
 # Wybór akcji z polityką epsilon-greedy
-def epsilon_greedy_policy(state, weights, epsilon):
+def epsilon_greedy_policy(state, weights, epsilon, step=0):
     if_stopped = False
     if np.random.rand() < epsilon:
         # Eksploracja: losowy wybór akcji
-        action = [
-            np.random.uniform(
-                -GLOBAL_VARS.wheel_turn_angle_max, GLOBAL_VARS.wheel_turn_angle_max
-            ),
-            np.random.uniform(-GLOBAL_VARS.Vmod, GLOBAL_VARS.Vmod),
-        ]  # Przykład zakresów
+        action = random.choice(PREDEFINED_ACTIONS)
     else:
         # Eksploatacja: wybór najlepszej akcji
         angle, V, if_stopped = choose_action(state, weights)
         action = [angle, V]
+    if step > 200:
+        if_stopped = True
     return action, if_stopped
 
 
 def update_weights(
     weights, state, action, reward, next_state, next_action, gamma, alpha
 ):
-    # Obliczamy wektor funkcji cech dla stanu i akcji oraz kolejnego stanu i akcji
-    current_features = get_tiles(state, action)  # Binarna tablica dla (S, A)
-    best_next_action = choose_action(next_state, weights)
-    best_next_action = [best_next_action[0], best_next_action[1]]
-    best_next_features = get_tiles(next_state, best_next_action)  # Binarna tablica dla (S', argmax_a Q(S', a))
+    current_features = encode_prototype(state, action)
+    next_q_values = np.array(
+        [np.dot(encode_prototype(next_state, a), weights) for a in PREDEFINED_ACTIONS]
+    )
 
-    # Obliczamy wartość Q dla obecnego stanu i akcji oraz kolejnego stanu i akcji
-    current_Q = np.dot(current_features, weights)
-    best_next_Q = np.dot(best_next_features, weights)
+    td_error = (
+        reward + gamma * np.max(next_q_values) - np.dot(current_features, weights)
+    )
 
-    # Obliczamy błąd TD: r + γ * Q(S', argmax_a Q(S', a)) - Q(S, A)
-    td_error = reward + gamma * best_next_Q - current_Q
-
-    # Aktualizacja wag: wagi = wagi + α * błąd TD * cechy
     weights += alpha * td_error * current_features
 
 
@@ -347,7 +384,8 @@ def update_weights_mini_batch(
         (weights, state, action, reward, next_state, next_action, gamma, alpha)
     )
     if len(experience_buffer) >= BATCH_SIZE:
-        for experience in experience_buffer:
+        batch = random.sample(experience_buffer, BATCH_SIZE)
+        for experience in batch:
             update_weights(*experience)
         experience_buffer.clear()
 
@@ -400,7 +438,7 @@ def park_train():
     liczba_stanow_poczatkowych, lparam = stany_poczatkowe.shape
 
     # Inicjalizujemy wagi
-    weights = np.zeros(iht_size)
+    weights = np.zeros(len(PROTOTYPES))
 
     for episode in tqdm(range(number_of_episodes)):
         epsilon = max(0.1, epsilon * 0.99)  # stopniowe zmniejszanie eksploracji
@@ -412,10 +450,11 @@ def park_train():
         step = 0
         if_collision = False
         if_stopped = False
-        while if_stopped == False:
+        total_reward = 0
+        while not if_stopped:
             step = step + 1
 
-            action, if_stopped = epsilon_greedy_policy(state, weights, epsilon)
+            action, if_stopped = epsilon_greedy_policy(state, weights, epsilon, step)
             angle, V = action
 
             # wyznaczenie nowego stanu:
@@ -426,19 +465,26 @@ def park_train():
             if if_collision or (step >= GLOBAL_VARS.max_number_of_steps):
                 if_stopped = True
 
-            # reward = reward_function(next_state, if_collision, step, if_stopped)
+            # reward = reward_function(next_state, state, if_collision, if_stopped)
+            # reward = reward_function2(next_state, if_collision, if_stopped)
             reward = nagroda_za_krok(GLOBAL_VARS, next_state, if_collision, if_stopped)
-            # reward = nagroda_za_krok2(next_state, state, step, if_collision, if_stopped)
-            # reward = nagroda_za_krok3(next_state, state, step, if_collision, if_stopped, V)
-            next_action, _ = epsilon_greedy_policy(next_state, weights, epsilon)
-            # update_weights(
+            # next_action, _ = epsilon_greedy_policy(next_state, weights, epsilon)
+
+
+            next_angle, next_V, _ = choose_action(next_state, weights)
+            next_action = [next_angle, next_V]
+            # update_weights_mini_batch(
             #     weights, state, action, reward, next_state, next_action, gamma, alpha
             # )
-            update_weights_mini_batch(
+            update_weights(
                 weights, state, action, reward, next_state, next_action, gamma, alpha
             )
 
             state = next_state
+            total_reward += reward
+
+        episode_rewards.append(total_reward)
+        episode_steps.append(step)
 
         # co jakis czas test z wygenerowaniem historii do pliku:
         if episode % 100 == 0:
@@ -457,3 +503,19 @@ ocena_koncowa_maks = pm.final_score(
 print("najlepsza możliwa ocena końcowa = " + str(ocena_koncowa_maks))
 
 park_train()
+
+# After training, plot results
+plt.figure(figsize=(12, 6))
+plt.subplot(1, 2, 1)
+plt.plot(episode_rewards, label="Rewards")
+plt.xlabel("Episodes")
+plt.ylabel("Total Reward")
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(episode_steps, label="Steps")
+plt.xlabel("Episodes")
+plt.ylabel("Steps")
+plt.legend()
+
+plt.show()
