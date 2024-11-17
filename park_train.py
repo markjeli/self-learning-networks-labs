@@ -1,6 +1,8 @@
 import numpy as np
 import random
-from sklearn.cluster import KMeans
+
+from numba import njit
+
 import parking_model as pm
 from tqdm import tqdm
 import matplotlib.pyplot as plt
@@ -9,11 +11,12 @@ import matplotlib.pyplot as plt
 GLOBAL_VARS = pm.GlobalVar()
 
 ## Training Hyperparameters
-ALPHA = 0.005  # Współczynnik uczenia
+ALPHA = 0.1  # Współczynnik uczenia
 EPSILON = 1.0  # Parametr eksploracji
-gamma = 0.90  # Czynnik dyskontujący
+GAMMA = 0.90  # Czynnik dyskontujący
+LAMBDA = 0.90  # Parametr świeżości (śladu)
 
-number_of_episodes = 1000
+number_of_episodes = 5000
 
 ## Actions
 PREDEFINED_ACTIONS = [
@@ -26,14 +29,26 @@ PREDEFINED_ACTIONS = [
     for speed in np.arange(-GLOBAL_VARS.Vmod, GLOBAL_VARS.Vmod + 1, 1)
     if not speed == 0
 ]
-# PREDEFINED_ACTIONS = [
-#     [angle, speed]
-#     for angle in np.linspace(
-#         -GLOBAL_VARS.wheel_turn_angle_max, GLOBAL_VARS.wheel_turn_angle_max, 10
-#     )  # Limit steering angles
-#     for speed in [-1.0, 1.0]  # Simplify to forward/backward
-# ]
 PREDEFINED_ACTIONS.append([0, 0])
+
+## Tiles
+IHT_SIZE = 4096  # Rozmiar tablicy kodowania (tile coding)
+num_tilings = 8  # Liczba pokryć
+tile_size = [
+    0.1,
+    0.1,
+    np.pi / 8,
+    np.pi / 8,
+    0.5,
+]  # Rozmiar kafelka dla (x, y, kąt, kąt skrętu, prędkość)
+# offsets = [
+#     (i / num_tilings) * np.array(tile_size) for i in range(num_tilings)
+# ]  # Przesunięcia dla każdego pokrycia
+
+offsets = [
+    (i - num_tilings // 2) / num_tilings * np.array(tile_size)
+    for i in range(num_tilings)
+] # Przesunięcia dla każdego pokrycia (centrowanie)
 
 ## Prototypes
 # Define ranges for x, y, and angle
@@ -60,16 +75,6 @@ angle_range = np.arange(
 PROTOTYPE_POSITIONS = [
     [x, y, angle] for x in x_range for y in y_range for angle in angle_range
 ]
-
-# Definiujemy prototypy akcji (np. różne kąty skrętu i prędkości)
-PROTOTYPE_ACTIONS = [
-    [-np.pi / 4, 1],
-    [0, 1],
-    [np.pi / 4, -1],
-    [0, -1],
-    [0, 0],
-]
-
 
 def generate_states_near_parking(num_states, parking_center):
     states = []
@@ -104,55 +109,8 @@ def initialize_prototypes(prototype_positions, prototype_actions):
     return np.array(prototypes)
 
 
-def initialize_prototypes_dynamic(
-    prototype_positions, prototype_actions, n_clusters=200
-):
-    # Create all possible state-action combinations
-    # Generate states near the parking slot
-    near_parking_states = generate_states_near_parking(
-        num_states=50, parking_center=[0, 0]
-    )
-
-    # Combine predefined positions and near parking states
-    all_positions = prototype_positions + near_parking_states
-
-    prototypes = np.array(
-        [
-            [pos[0], pos[1], pos[2], action[0], action[1]]
-            for pos in all_positions
-            for action in prototype_actions
-        ]
-    )
-
-    # Use KMeans to cluster prototypes dynamically
-    kmeans = KMeans(n_clusters=n_clusters).fit(prototypes) # , random_state=42
-    clustered_prototypes = kmeans.cluster_centers_
-
-    return clustered_prototypes
-
-
 # Inicjalizujemy prototypy jako kombinacje stanów i akcji
 PROTOTYPES = initialize_prototypes(PROTOTYPE_POSITIONS, PREDEFINED_ACTIONS)
-# PROTOTYPES = initialize_prototypes_dynamic(PROTOTYPE_POSITIONS, PREDEFINED_ACTIONS)
-
-prototype_positions = [
-    [0, 0, 0],  # Stan 1
-    [-10, 0, 0],  # Stan 2
-    # [0, 10, np.pi/2],  # Stan 3
-    # [10, 10, np.pi],   # Stan 4
-    # [5, 5, np.pi/4]    # Stan 5
-]
-
-# Definiujemy prototypy akcji (np. różne kąty skrętu i prędkości)
-prototype_actions = [
-    [-np.pi / 4, 1],  # Akcja 1
-    [0, 1],  # Akcja 2
-    [np.pi / 4, -1],  # Akcja 3
-    [0, -1],  # Akcja 4
-    [0, 0],  # Akcja 5
-]
-
-# PROTOTYPES = initialize_prototypes(prototype_positions, PREDEFINED_ACTIONS)
 
 ## Batching
 BATCH_SIZE = 10
@@ -250,6 +208,38 @@ def reward_function2(state, if_collision, if_stopped):
     else:
         return 0.1 * distance_reward  # Gradual reward for progress
 
+def final_score(state, if_collision, num_of_steps):
+
+    x = state[0]
+    y = state[1]
+    angle = state[2]
+
+    distance = np.sqrt(x * x + y * y)
+
+    angle_reduced = 0
+    if GLOBAL_VARS.if_side_parking_place:
+        if np.abs(angle) > np.pi / 2:
+            angle_reduced = np.pi - np.abs(angle)
+        else:
+            angle_reduced = np.abs(angle)
+    else:
+        angle_reduced = np.abs(np.abs(angle) - np.pi / 2)
+
+    rational_num_of_steps = (
+        GLOBAL_VARS.park_depth + GLOBAL_VARS.street_width + GLOBAL_VARS.street_length
+    ) / (GLOBAL_VARS.Vmod * GLOBAL_VARS.dt)
+    excess_step_num = max(num_of_steps - rational_num_of_steps, 0)
+
+    score = (
+        10
+        / (1 + distance)
+        / (1 + angle_reduced * 2)
+        / (1 + int(if_collision))
+        / (1 + excess_step_num / rational_num_of_steps)
+    )
+
+    return score
+
 
 def check_if_stopped(state) -> bool:
     x, y, angle = state
@@ -322,6 +312,28 @@ def park_test(param_fiz, stany_poczatkowe, model, nazwa_pliku):
     return sr_ocena_koncowa
 
 
+# Funkcja do generowania unikalnych indeksów kafelków
+@njit
+def tile_hash(indices):
+    return sum([index * (i + 1) for i, index in enumerate(indices)]) % IHT_SIZE
+
+
+def get_tiles(state, action):
+    tile_vector = np.zeros(IHT_SIZE)  # Binarna tablica o rozmiarze iht_size
+    combined_state_action = np.concatenate(
+        (state, action), axis=0
+    )  # Łączymy stan i akcję
+
+    for offset in offsets:
+        # Obliczamy indeks kafelka dla danej przesuniętej kombinacji stan+akcja
+        tile_index = np.floor((combined_state_action + offset) / tile_size).astype(int)
+        # Hashujemy indeks kafelka i ustawiamy go na 1 w binarnej tablicy
+        index = tile_hash(tile_index)
+        tile_vector[index] = 1  # Aktywujemy kafelek w tablicy
+
+    return tile_vector
+
+
 def encode_prototype(state, action):
     k = 1
     # Łączenie stanu i akcji w jeden wektor
@@ -341,7 +353,7 @@ def encode_prototype(state, action):
 
 
 def Q_value(state, action, weights):
-    features = encode_prototype(
+    features = get_tiles(
         state, action
     )  # Otrzymujemy binarną tablicę aktywnych kafelków
     return np.dot(features, weights)  # Mnożenie macierzy, aby uzyskać wartość Q
@@ -363,36 +375,38 @@ def epsilon_greedy_policy(state, weights, epsilon, step=0):
 
 
 def update_weights(
-    weights, state, action, reward, next_state, next_action, gamma, alpha
+    weights, state, action, reward, next_state, z, gamma, alpha
 ):
-    current_features = encode_prototype(state, action)
+    current_features = get_tiles(state, action)
     next_q_values = np.array(
-        [np.dot(encode_prototype(next_state, a), weights) for a in PREDEFINED_ACTIONS]
+        [np.dot(get_tiles(next_state, a), weights) for a in PREDEFINED_ACTIONS]
     )
+
+    z = gamma * LAMBDA * z + current_features
 
     td_error = (
         reward + gamma * np.max(next_q_values) - np.dot(current_features, weights)
     )
 
-    weights += alpha * td_error * current_features
+    weights += alpha * td_error * z
+    return weights, z
 
 
 def update_weights_mini_batch(
-    weights, state, action, reward, next_state, next_action, gamma, alpha
+    weights, state, action, reward, next_state, z, gamma, alpha
 ):
-    experience_buffer.append(
-        (weights, state, action, reward, next_state, next_action, gamma, alpha)
-    )
+    experience_buffer.append((state, action, reward, next_state))
     if len(experience_buffer) >= BATCH_SIZE:
         batch = random.sample(experience_buffer, BATCH_SIZE)
-        for experience in batch:
-            update_weights(*experience)
+        for state, action, reward, next_state in batch:
+            weights, z = update_weights(weights, state, action, reward, next_state, z, gamma, alpha)
         experience_buffer.clear()
-
+    return weights, z
 
 def park_train():
     alpha = ALPHA
     epsilon = EPSILON
+    gamma = GAMMA
 
     stany_poczatkowe_1 = np.array(
         [
@@ -438,10 +452,17 @@ def park_train():
     liczba_stanow_poczatkowych, lparam = stany_poczatkowe.shape
 
     # Inicjalizujemy wagi
-    weights = np.zeros(len(PROTOTYPES))
+    weights = np.zeros(IHT_SIZE)
+    z = np.zeros(IHT_SIZE)
+    # weights = np.zeros(len(PROTOTYPES))
+    # z = np.zeros(len(PROTOTYPES))
+
 
     for episode in tqdm(range(number_of_episodes)):
-        epsilon = max(0.1, epsilon * 0.99)  # stopniowe zmniejszanie eksploracji
+        epsilon = max(0.1, epsilon * 0.995)  # stopniowe zmniejszanie eksploracji
+        alpha = max(0.001, ALPHA * (0.99 ** episode))
+
+        z[:] = 0
 
         # Wybieramy stan poczatkowy:
         nr_stanup = episode % liczba_stanow_poczatkowych
@@ -468,16 +489,13 @@ def park_train():
             # reward = reward_function(next_state, state, if_collision, if_stopped)
             # reward = reward_function2(next_state, if_collision, if_stopped)
             reward = nagroda_za_krok(GLOBAL_VARS, next_state, if_collision, if_stopped)
-            # next_action, _ = epsilon_greedy_policy(next_state, weights, epsilon)
+            # reward = final_score(next_state, if_collision, step)
 
-
-            next_angle, next_V, _ = choose_action(next_state, weights)
-            next_action = [next_angle, next_V]
-            # update_weights_mini_batch(
-            #     weights, state, action, reward, next_state, next_action, gamma, alpha
+            # weights, z = update_weights_mini_batch(
+            #     weights, state, action, reward, next_state, z, gamma, alpha
             # )
-            update_weights(
-                weights, state, action, reward, next_state, next_action, gamma, alpha
+            weights, z = update_weights(
+                weights, state, action, reward, next_state, z, gamma, alpha
             )
 
             state = next_state
