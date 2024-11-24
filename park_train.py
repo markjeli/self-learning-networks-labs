@@ -7,7 +7,7 @@ from numba import njit
 from tqdm import tqdm
 
 import parking_model as pm
-from model import PolicyNet
+from model import DQN
 
 # Global Variables
 GLOBAL_VARS = pm.GlobalVar()
@@ -17,9 +17,8 @@ ALPHA = 0.001  # Współczynnik uczenia
 EPS_START = 0.9
 EPS_END = 0.05
 GAMMA = 0.99  # Czynnik dyskontujący
-LAMBDA = 0.8  # Parametr świeżości (śladu)
 
-number_of_episodes = 5000
+number_of_episodes = 1000
 
 ## Actions
 PREDEFINED_ACTIONS = [
@@ -34,32 +33,9 @@ PREDEFINED_ACTIONS = [
 ]
 # PREDEFINED_ACTIONS.append([0, 0])
 
-## Tiles
-IHT_SIZE = 4096  # Rozmiar tablicy kodowania (tile coding)
-num_tilings = 8  # Liczba pokryć
-tile_size = [
-    0.5,
-    0.5,
-    np.pi / 8,
-    np.pi / 8,
-    0.5,
-]  # Rozmiar kafelka dla (x, y, kąt, kąt skrętu, prędkość)
-# offsets = [
-#     (i / num_tilings) * np.array(tile_size) for i in range(num_tilings)
-# ]  # Przesunięcia dla każdego pokrycia
-
-offsets = [
-    (i - num_tilings // 2) / num_tilings * np.array(tile_size)
-    for i in range(num_tilings)
-] # Przesunięcia dla każdego pokrycia (centrowanie)
-
-
 ## Batching
 BATCH_SIZE = 10
 experience_buffer = []
-
-## Cache
-cached_features = []
 
 ## Logging
 episode_rewards = []
@@ -77,6 +53,8 @@ def optimize_model():
 
     batch = random.sample(experience_buffer, BATCH_SIZE)
 
+    # TODO: add mask for non-terminal states
+
     state_batch = torch.cat([state for state, _, _, _ in batch])
     action_batch = torch.cat([action for _, action, _, _ in batch])
     reward_batch = torch.cat([reward for _, _, reward, _ in batch])
@@ -89,35 +67,31 @@ def optimize_model():
 
     # Compute Q-values for the next states using the policy_net
     with torch.inference_mode():
-        next_state_values = policy_net(next_state_batch).max(1).values
+        next_state_values = target_net(next_state_batch).max(1).values
 
+    # Compute the expected Q values
+    expected_state_action_values = (next_state_values * GAMMA) + reward_batch
 
-    # Compute the TD target
-    td_target = reward_batch + GAMMA * next_state_values
+    # Compute Huber loss
+    criterion = torch.nn.SmoothL1Loss()
+    loss = criterion(state_action_values, expected_state_action_values.unsqueeze(1))
 
-    # Compute the TD error
-    td_error = td_target - state_action_values
-
-    # # Compute gradients for the policy_net
-    loss = td_error.pow(2).mean()  # Using MSE for simplicity
-    loss.backward()  # Backpropagate to compute gradients
-
-
+    # Optimize the model
+    optimizer.zero_grad()
+    loss.backward()
     # In-place gradient clipping
-    # torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
-    torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
-
-    # Update weights directly using the computed gradients
-    for param in policy_net.parameters():
-        param.data += ALPHA * td_error.mean().item() * param.grad.data  # TODO: Check if we add or subtract the gradient
-
-    # Zero gradients after updating
-    policy_net.zero_grad()
+    torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
+    optimizer.step()
 
 
 ## Neural Model
-policy_net = PolicyNet(NUMBER_OF_FEATURES, NUMBER_OF_ACTIONS).to(DEVICE)
-optimizer = torch.optim.AdamW(policy_net.parameters(), lr=ALPHA, amsgrad=True)
+LR = 1e-4
+TAU = 0.005
+policy_net = DQN(NUMBER_OF_FEATURES, NUMBER_OF_ACTIONS).to(DEVICE)
+target_net = DQN(NUMBER_OF_FEATURES, NUMBER_OF_ACTIONS).to(DEVICE)
+target_net.load_state_dict(policy_net.state_dict())
+
+optimizer = torch.optim.AdamW(policy_net.parameters(), lr=LR, amsgrad=True)
 ##############################
 
 
@@ -314,35 +288,8 @@ def park_test(param_fiz, stany_poczatkowe, model, nazwa_pliku):
     return sr_ocena_koncowa
 
 
-# Funkcja do generowania unikalnych indeksów kafelków
-@njit
-def tile_hash(indices):
-    return sum([index * (i + 1) for i, index in enumerate(indices)]) % IHT_SIZE
-
-
-def get_tiles(state, action):
-    tile_vector = np.zeros(IHT_SIZE)  # Binarna tablica o rozmiarze iht_size
-    combined_state_action = np.concatenate((state, action))  # Łączymy stan i akcję
-
-    for offset in offsets:
-        # Obliczamy indeks kafelka dla danej przesuniętej kombinacji stan+akcja
-        tile_index = np.floor((combined_state_action + offset) / tile_size).astype(int)
-        # Hashujemy indeks kafelka i ustawiamy go na 1 w binarnej tablicy
-        index = tile_hash(tile_index)
-        tile_vector[index] = 1  # Aktywujemy kafelek w tablicy
-
-    return tile_vector
-
-
-def Q_value(state, action, weights):
-    features = get_tiles(
-        state, action
-    )  # Otrzymujemy binarną tablicę aktywnych kafelków
-    return np.dot(features, weights)  # Mnożenie macierzy, aby uzyskać wartość Q
-
-
 # Wybór akcji z polityką epsilon-greedy
-def epsilon_greedy_policy(state, weights, epsilon, step=0):
+def epsilon_greedy_policy(state, epsilon, step=0):
     if_stopped = False
     if np.random.rand() < epsilon:
         # Eksploracja: losowy wybór akcji
@@ -361,41 +308,8 @@ def epsilon_greedy_policy(state, weights, epsilon, step=0):
         if_stopped = True
     return action_idx, if_stopped
 
-
-def update_weights(
-    weights, state, action, reward, next_state, z, gamma, alpha
-):
-    current_features = get_tiles(state, action)
-    next_q_values = np.array(
-        [Q_value(next_state, a, weights) for a in PREDEFINED_ACTIONS]
-        # [np.dot(get_tiles(next_state, a), weights) for a in PREDEFINED_ACTIONS]
-    )
-
-    z = gamma * LAMBDA * z + current_features
-
-    td_error = (
-        reward + gamma * np.max(next_q_values) - np.dot(current_features, weights)
-    )
-
-    weights += alpha * td_error * z
-    return weights, z
-
-
-def update_weights_mini_batch(
-    weights, state, action, reward, next_state, z, gamma, alpha
-):
-    experience_buffer.append((state, action, reward, next_state))
-    if len(experience_buffer) >= BATCH_SIZE:
-        batch = random.sample(experience_buffer, BATCH_SIZE)
-        for state, action, reward, next_state in batch:
-            weights, z = update_weights(weights, state, action, reward, next_state, z, gamma, alpha)
-        experience_buffer.clear()
-    return weights, z
-
 def park_train():
-    alpha = ALPHA
     epsilon = EPS_START
-    gamma = GAMMA
 
     stany_poczatkowe_1 = np.array(
         [
@@ -440,15 +354,11 @@ def park_train():
     stany_poczatkowe = stany_poczatkowe_1
     liczba_stanow_poczatkowych, lparam = stany_poczatkowe.shape
 
-    # Inicjalizujemy wagi
-    weights = np.zeros(IHT_SIZE)
-    z = np.zeros(IHT_SIZE)
+    weights = 0
 
 
     for episode in tqdm(range(number_of_episodes)):
         epsilon = max(EPS_END, epsilon * 0.99)  # stopniowe zmniejszanie eksploracji
-
-        z[:] = 0
 
         # Wybieramy stan poczatkowy:
         nr_stanup = episode % liczba_stanow_poczatkowych
@@ -462,7 +372,7 @@ def park_train():
         while not if_stopped:
             step = step + 1
 
-            action_idx, if_stopped = epsilon_greedy_policy(state, weights, epsilon, step)
+            action_idx, if_stopped = epsilon_greedy_policy(state, epsilon, step)
             angle, V = PREDEFINED_ACTIONS[action_idx]
 
             # wyznaczenie nowego stanu:
@@ -484,6 +394,13 @@ def park_train():
 
             state = next_state
             total_reward += reward
+
+            # Soft update of target network
+            target_net_state_dict = target_net.state_dict()
+            policy_net_state_dict = policy_net.state_dict()
+            for key in policy_net_state_dict:
+                target_net_state_dict[key] = policy_net_state_dict[key] * TAU + target_net_state_dict[key] * (1 - TAU)
+            target_net.load_state_dict(target_net_state_dict)
 
         episode_rewards.append(total_reward)
         episode_steps.append(step)
