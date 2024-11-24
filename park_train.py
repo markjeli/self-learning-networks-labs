@@ -2,18 +2,21 @@ import random
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from numba import njit
 from tqdm import tqdm
 
 import parking_model as pm
+from model import PolicyNet
 
 # Global Variables
 GLOBAL_VARS = pm.GlobalVar()
 
 ## Training Hyperparameters
 ALPHA = 0.001  # Współczynnik uczenia
-EPSILON = 1.0  # Parametr eksploracji
-GAMMA = 1.0  # Czynnik dyskontujący
+EPS_START = 0.9
+EPS_END = 0.05
+GAMMA = 0.99  # Czynnik dyskontujący
 LAMBDA = 0.8  # Parametr świeżości (śladu)
 
 number_of_episodes = 5000
@@ -61,6 +64,65 @@ cached_features = []
 ## Logging
 episode_rewards = []
 episode_steps = []
+
+### Code for neural network training
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+NUMBER_OF_FEATURES = 3 # 3 for state (x, y, angle)
+NUMBER_OF_ACTIONS = len(PREDEFINED_ACTIONS)
+
+def optimize_model():
+    if len(experience_buffer) < BATCH_SIZE:
+        return
+
+    batch = random.sample(experience_buffer, BATCH_SIZE)
+
+    state_batch = torch.cat([state for state, _, _, _ in batch])
+    action_batch = torch.cat([action for _, action, _, _ in batch])
+    reward_batch = torch.cat([reward for _, _, reward, _ in batch])
+    next_state_batch = torch.cat([next_state for _, _, _, next_state in batch])
+
+    # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
+    # columns of actions taken. These are the actions which would've been taken
+    # for each batch state according to policy_net
+    state_action_values = policy_net(state_batch).gather(1, action_batch)
+
+    # Compute Q-values for the next states using the policy_net
+    with torch.inference_mode():
+        next_state_values = policy_net(next_state_batch).max(1).values
+
+
+    # Compute the TD target
+    td_target = reward_batch + GAMMA * next_state_values
+
+    # Compute the TD error
+    td_error = td_target - state_action_values
+
+    # # Compute gradients for the policy_net
+    loss = td_error.pow(2).mean()  # Using MSE for simplicity
+    loss.backward()  # Backpropagate to compute gradients
+
+
+    # In-place gradient clipping
+    # torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
+    torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
+
+    # Update weights directly using the computed gradients
+    for param in policy_net.parameters():
+        param.data += ALPHA * td_error.mean().item() * param.grad.data  # TODO: Check if we add or subtract the gradient
+
+    # Zero gradients after updating
+    policy_net.zero_grad()
+
+
+## Neural Model
+policy_net = PolicyNet(NUMBER_OF_FEATURES, NUMBER_OF_ACTIONS).to(DEVICE)
+optimizer = torch.optim.AdamW(policy_net.parameters(), lr=ALPHA, amsgrad=True)
+##############################
+
+
+
+
 
 
 # przykładowa nagroda za krok - nie wiem czy dobra
@@ -191,13 +253,16 @@ def check_if_stopped(state) -> bool:
 
 
 def choose_action(state, weights, param_fiz=GLOBAL_VARS):
-    q_values = np.array(
-        [Q_value(state, action, weights) for action in PREDEFINED_ACTIONS]
-    )
-    action = PREDEFINED_ACTIONS[np.argmax(q_values)]
+    state = torch.tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+    with torch.inference_mode():
+        # t.max(1) will return the largest column value of each row.
+        # second column on max result is index of where max element was
+        # found, so we pick action with the larger expected reward.
+        action_idx = policy_net(state).max(1).indices.view(1, 1)
 
+    action = PREDEFINED_ACTIONS[action_idx]
     angle, V = action
-    if_stopped = check_if_stopped(state) or V == 0
+    if_stopped = check_if_stopped(state.squeeze()) or V == 0
     return angle, V, if_stopped
 
 
@@ -281,14 +346,20 @@ def epsilon_greedy_policy(state, weights, epsilon, step=0):
     if_stopped = False
     if np.random.rand() < epsilon:
         # Eksploracja: losowy wybór akcji
-        action = random.choice(PREDEFINED_ACTIONS)
+        action_idx = torch.tensor(np.random.choice(len(PREDEFINED_ACTIONS)), device=DEVICE).view(1, 1)
     else:
         # Eksploatacja: wybór najlepszej akcji
-        angle, V, if_stopped = choose_action(state, weights)
-        action = [angle, V]
+        with torch.inference_mode():
+            # t.max(1) will return the largest column value of each row.
+            # second column on max result is index of where max element was
+            # found, so we pick action with the larger expected reward.
+            action_idx = policy_net(state).max(1).indices.view(1, 1)
+
+        # angle, V, if_stopped = choose_action(state, weights)
+        # action = [angle, V]
     if step > 200:
         if_stopped = True
-    return action, if_stopped
+    return action_idx, if_stopped
 
 
 def update_weights(
@@ -296,7 +367,8 @@ def update_weights(
 ):
     current_features = get_tiles(state, action)
     next_q_values = np.array(
-        [np.dot(get_tiles(next_state, a), weights) for a in PREDEFINED_ACTIONS]
+        [Q_value(next_state, a, weights) for a in PREDEFINED_ACTIONS]
+        # [np.dot(get_tiles(next_state, a), weights) for a in PREDEFINED_ACTIONS]
     )
 
     z = gamma * LAMBDA * z + current_features
@@ -322,7 +394,7 @@ def update_weights_mini_batch(
 
 def park_train():
     alpha = ALPHA
-    epsilon = EPSILON
+    epsilon = EPS_START
     gamma = GAMMA
 
     stany_poczatkowe_1 = np.array(
@@ -374,13 +446,14 @@ def park_train():
 
 
     for episode in tqdm(range(number_of_episodes)):
-        epsilon = max(0.1, epsilon * 0.99)  # stopniowe zmniejszanie eksploracji
+        epsilon = max(EPS_END, epsilon * 0.99)  # stopniowe zmniejszanie eksploracji
 
         z[:] = 0
 
         # Wybieramy stan poczatkowy:
         nr_stanup = episode % liczba_stanow_poczatkowych
         state = stany_poczatkowe[nr_stanup, :]
+        state = torch.tensor(state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
 
         step = 0
         if_collision = False
@@ -389,28 +462,25 @@ def park_train():
         while not if_stopped:
             step = step + 1
 
-            action, if_stopped = epsilon_greedy_policy(state, weights, epsilon, step)
-            angle, V = action
+            action_idx, if_stopped = epsilon_greedy_policy(state, weights, epsilon, step)
+            angle, V = PREDEFINED_ACTIONS[action_idx]
 
             # wyznaczenie nowego stanu:
             next_state, rotation_center, if_collision = pm.model_of_car(
-                GLOBAL_VARS, state, angle, V
+                GLOBAL_VARS, state.squeeze(), angle, V
             )
+            next_state = torch.tensor(next_state, dtype=torch.float32, device=DEVICE).unsqueeze(0)
 
             if if_collision or (step >= GLOBAL_VARS.max_number_of_steps):
                 if_stopped = True
 
-            reward = reward_function(next_state, state, if_collision, if_stopped)
-            # reward = reward_function2(next_state, if_collision, if_stopped)
-            # reward = nagroda_za_krok(GLOBAL_VARS, next_state, if_collision, if_stopped)
-            # reward = final_score_reward(next_state, if_collision, step)
+            # reward = reward_function(next_state.squeeze(), state.squeeze(), if_collision, if_stopped)
+            reward = reward_function2(next_state.squeeze(), if_collision, if_stopped)
+            # reward = final_score_reward(next_state.squeeze(), if_collision, step)
+            reward = torch.tensor([reward], dtype=torch.float32, device=DEVICE)
 
-            # weights, z = update_weights_mini_batch(
-            #     weights, state, action, reward, next_state, z, gamma, alpha
-            # )
-            weights, z = update_weights(
-                weights, state, action, reward, next_state, z, gamma, alpha
-            )
+            experience_buffer.append((state, action_idx, reward, next_state))
+            optimize_model()
 
             state = next_state
             total_reward += reward
