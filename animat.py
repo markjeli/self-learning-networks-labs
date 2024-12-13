@@ -17,6 +17,24 @@ class PolicyNetwork(nn.Module):
         return x
 
 
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = []
+        self.capacity = capacity
+
+    def add(self, observation, action, reward):
+        self.buffer.append((observation, action, reward))
+        if len(self.buffer) > self.capacity:
+            self.buffer.pop(0)
+
+    def sample(self, batch_size):
+        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
+        observation, action, reward = zip(*[self.buffer[i] for i in indices])
+        return observation, action, reward
+
+    def __len__(self):
+        return len(self.buffer)
+
 # static map from lecture:
 type_of_map = -1
 obs_size = 3  # size of observable area e.g 3x3
@@ -46,7 +64,8 @@ if_cross = True  # observable area is cross-shaped e.g agent see only vertical a
 def my_action(strategy, observation):
     # Convert observation to tensor and pass through policy network to get action probabilities
     observation_tensor = torch.tensor(observation, dtype=torch.float32).unsqueeze(0)
-    action_probs = strategy(observation_tensor).squeeze(0).detach().numpy()
+    with torch.inference_mode():
+        action_probs = strategy(observation_tensor).squeeze(0).detach().numpy()
     action = np.random.choice(
         len(action_probs), p=action_probs
     )  # Sample action based on probabilities
@@ -55,14 +74,15 @@ def my_action(strategy, observation):
 
 def animat_train(type_of_map, obs_size=3, if_cross=False):
     gamma = 0.97  # can be changed in training and test for the same value
-    lr = 0.01
-    # epsilon = ...
-    number_of_episodes = 100
+    lr = 0.001
+    number_of_episodes = 500
+    batch_size = 32
 
     # Initialize policy network and optimizer
     input_size = obs_size * obs_size if not if_cross else 2 * obs_size - 1
     policy_net = PolicyNetwork(input_size)
     optimizer = torch.optim.Adam(policy_net.parameters(), lr=lr)
+    replay_buffer = ReplayBuffer(capacity=1000)
 
     for epi in range(number_of_episodes):
         map = afun.generate_map(
@@ -93,6 +113,7 @@ def animat_train(type_of_map, obs_size=3, if_cross=False):
             new_position, reward = afun.transition_and_reward(map, position, action)
 
             trajectories.append((observation_flat, action, reward))
+            replay_buffer.add(observation_flat, action, reward)
 
             if reward > 0 or step_number > max_num_of_steps:
                 if_end = True
@@ -102,28 +123,30 @@ def animat_train(type_of_map, obs_size=3, if_cross=False):
             cumulated_gamma *= gamma
 
         # Process trajectories for policy update
-        returns = []
-        G = 0
-        for _, _, reward in reversed(trajectories):
-            G = reward + gamma * G
-            returns.insert(0, G)
-        returns = torch.tensor(returns, dtype=torch.float32)
-        returns = (returns - returns.mean()) / (
-            returns.std() + 1e-8
-        )  # Normalize returns
+        if len(replay_buffer) >= batch_size:
+            observations, actions, rewards = replay_buffer.sample(batch_size)
 
-        observations, actions, _ = zip(*trajectories)
-        observations = torch.tensor(observations, dtype=torch.float32)
-        actions = torch.tensor(actions, dtype=torch.int64)
+            returns = []
+            G = 0
+            for reward in rewards:
+                G = reward + gamma * G
+                returns.insert(0, G)
+            returns = torch.tensor(returns, dtype=torch.float32)
+            returns = (returns - returns.mean()) / (
+                returns.std() + 1e-8
+            )  # Normalize returns
 
-        # Compute loss and update policy network
-        action_probs = policy_net(observations)
-        log_probs = torch.log(action_probs[range(len(actions)), actions])
-        loss = -(log_probs * returns).mean()
+            observations = torch.tensor(observations, dtype=torch.float32)
+            actions = torch.tensor(actions, dtype=torch.int64)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            # Compute loss and update policy network
+            action_probs = policy_net(observations)
+            log_probs = torch.log(action_probs[range(len(actions)), actions])
+            loss = -(log_probs * returns).mean()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
     return policy_net
 

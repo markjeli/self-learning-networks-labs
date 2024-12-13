@@ -125,3 +125,5 @@ cython_debug/
 
 # PyCharm
 .idea/
+
+*.txt
