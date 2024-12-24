@@ -1,3 +1,4 @@
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch import nn
@@ -9,31 +10,34 @@ class PolicyNetwork(nn.Module):
     def __init__(self, input_size):
         super(PolicyNetwork, self).__init__()
         self.layer1 = nn.Linear(input_size, 128)
-        self.layer2 = nn.Linear(128, 4)
+        self.act1 = nn.ReLU()
+        self.layer2 = nn.Linear(128, 64)
+        self.act2 = nn.ReLU()
+        self.output = nn.Linear(64, 4)
+        self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x):
-        x = torch.relu(self.layer1(x))
-        x = torch.softmax(self.layer2(x), dim=-1)
+        x = self.act1(self.layer1(x))
+        x = self.act2(self.layer2(x))
+        x = self.softmax(self.output(x))
         return x
 
 
-class ReplayBuffer:
-    def __init__(self, capacity):
-        self.buffer = []
-        self.capacity = capacity
+class ValueNetwork(nn.Module):
+    def __init__(self, input_size):
+        super(ValueNetwork, self).__init__()
+        self.layer1 = nn.Linear(input_size, 128)
+        self.act1 = nn.ReLU()
+        self.layer2 = nn.Linear(128, 64)
+        self.act2 = nn.ReLU()
+        self.output = nn.Linear(64, 1)
 
-    def add(self, observation, action, reward):
-        self.buffer.append((observation, action, reward))
-        if len(self.buffer) > self.capacity:
-            self.buffer.pop(0)
+    def forward(self, x):
+        x = self.act1(self.layer1(x))
+        x = self.act2(self.layer2(x))
+        x = self.output(x)
+        return x
 
-    def sample(self, batch_size):
-        indices = np.random.choice(len(self.buffer), batch_size, replace=False)
-        observation, action, reward = zip(*[self.buffer[i] for i in indices])
-        return observation, action, reward
-
-    def __len__(self):
-        return len(self.buffer)
 
 # static map from lecture:
 type_of_map = -1
@@ -62,10 +66,8 @@ if_cross = True  # observable area is cross-shaped e.g agent see only vertical a
 
 
 def my_action(strategy, observation):
-    # Convert observation to tensor and pass through policy network to get action probabilities
     observation_tensor = torch.tensor(observation, dtype=torch.float32).unsqueeze(0)
-    with torch.inference_mode():
-        action_probs = strategy(observation_tensor).squeeze(0).detach().numpy()
+    action_probs = strategy(observation_tensor).squeeze(0).detach().numpy()
     action = np.random.choice(
         len(action_probs), p=action_probs
     )  # Sample action based on probabilities
@@ -73,16 +75,18 @@ def my_action(strategy, observation):
 
 
 def animat_train(type_of_map, obs_size=3, if_cross=False):
-    gamma = 0.97  # can be changed in training and test for the same value
+    gamma = 0.98  # can be changed in training and test for the same value
     lr = 0.001
-    number_of_episodes = 500
-    batch_size = 32
+    number_of_episodes = 1000
 
     # Initialize policy network and optimizer
-    input_size = obs_size * obs_size if not if_cross else 2 * obs_size - 1
+    input_size = obs_size**2
     policy_net = PolicyNetwork(input_size)
-    optimizer = torch.optim.Adam(policy_net.parameters(), lr=lr)
-    replay_buffer = ReplayBuffer(capacity=1000)
+    value_net = ValueNetwork(input_size)
+    policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=lr)
+    value_optimizer = torch.optim.Adam(value_net.parameters(), lr=lr)
+
+    losses = {"policy": [], "value": []}
 
     for epi in range(number_of_episodes):
         map = afun.generate_map(
@@ -102,18 +106,13 @@ def animat_train(type_of_map, obs_size=3, if_cross=False):
         while not if_end:
             step_number += 1
 
-            # square region observed by agent:
-            observation = afun.observable_region(map, obs_size, position, if_cross)
-            observation_flat = (
-                observation[observation != -1] if if_cross else observation.flatten()
-            )
-
-            action = my_action(policy_net, observation_flat)
-
+            observation = afun.observable_region(
+                map, obs_size, position, if_cross
+            ).flatten()
+            action = my_action(policy_net, observation)
             new_position, reward = afun.transition_and_reward(map, position, action)
 
-            trajectories.append((observation_flat, action, reward))
-            replay_buffer.add(observation_flat, action, reward)
+            trajectories.append((observation, action, reward))
 
             if reward > 0 or step_number > max_num_of_steps:
                 if_end = True
@@ -122,37 +121,52 @@ def animat_train(type_of_map, obs_size=3, if_cross=False):
             sum_of_discounted_rewards += reward * cumulated_gamma
             cumulated_gamma *= gamma
 
-        # Process trajectories for policy update
-        if len(replay_buffer) >= batch_size:
-            observations, actions, rewards = replay_buffer.sample(batch_size)
+        observations, actions, rewards = zip(*trajectories)
+        returns = []
+        G = 0
+        for reward in reversed(rewards):
+            G = reward + gamma * G
+            returns.insert(0, G)
 
-            returns = []
-            G = 0
-            for reward in rewards:
-                G = reward + gamma * G
-                returns.insert(0, G)
-            returns = torch.tensor(returns, dtype=torch.float32)
-            returns = (returns - returns.mean()) / (
-                returns.std() + 1e-8
-            )  # Normalize returns
+        returns = torch.tensor(returns, dtype=torch.float32)
+        observations = torch.tensor(observations, dtype=torch.float32)
+        values = value_net(observations).squeeze(1)
 
-            observations = torch.tensor(observations, dtype=torch.float32)
-            actions = torch.tensor(actions, dtype=torch.int64)
+        action_probs = policy_net(observations)
+        log_probs = torch.log(action_probs[range(len(actions)), actions])
+        advantage = returns - values.detach()
 
-            # Compute loss and update policy network
-            action_probs = policy_net(observations)
-            log_probs = torch.log(action_probs[range(len(actions)), actions])
-            loss = -(log_probs * returns).mean()
+        policy_loss = -(log_probs * advantage).mean()
+        criterion = nn.MSELoss()
+        value_loss = criterion(values, returns)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        policy_optimizer.zero_grad()
+        policy_loss.backward()
+        policy_optimizer.step()
+
+        value_optimizer.zero_grad()
+        value_loss.backward()
+        value_optimizer.step()
+
+        if epi % 100 == 0:
+            print(f"Episode {epi}, Total Reward: {sum_of_discounted_rewards}")
+
+        losses["policy"].append(policy_loss.item())
+        losses["value"].append(value_loss.item())
+
+    plt.plot(losses["policy"], label="Policy Loss")
+    plt.plot(losses["value"], label="Value Loss")
+    plt.xlabel("Training Steps")
+    plt.ylabel("Loss")
+    plt.title("Training Loss")
+    plt.legend()
+    plt.show()
 
     return policy_net
 
 
 def animat_test(strategy, type_of_map, obs_size=3, if_cross=False):
-    gamma = 0.97  # can be changed in training and test for the same value
+    gamma = 0.98  # can be changed in training and test for the same value
     number_of_episodes = 100
 
     mean_sum_of_discounted_rewards = 0
@@ -175,12 +189,11 @@ def animat_test(strategy, type_of_map, obs_size=3, if_cross=False):
             step_number += 1
 
             # square region observed by agent:
-            observation = afun.observable_region(map, obs_size, position, if_cross)
-            observation_flat = (
-                observation[observation != -1] if if_cross else observation.flatten()
-            )
+            observation = afun.observable_region(
+                map, obs_size, position, if_cross
+            ).flatten()
             # print(str(observation))
-            action = my_action(strategy, observation_flat)
+            action = my_action(strategy, observation)
 
             new_position, reward = afun.transition_and_reward(map, position, action)
 
