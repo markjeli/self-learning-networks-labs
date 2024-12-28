@@ -1,3 +1,5 @@
+from logging import critical
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -6,9 +8,9 @@ from torch import nn
 import animat_fun as afun
 
 
-class PolicyNetwork(nn.Module):
+class ActorNetwork(nn.Module):
     def __init__(self, input_size):
-        super(PolicyNetwork, self).__init__()
+        super(ActorNetwork, self).__init__()
         self.layer1 = nn.Linear(input_size, 128)
         self.act1 = nn.ReLU()
         self.layer2 = nn.Linear(128, 64)
@@ -23,9 +25,9 @@ class PolicyNetwork(nn.Module):
         return x
 
 
-class ValueNetwork(nn.Module):
+class CriticNetwork(nn.Module):
     def __init__(self, input_size):
-        super(ValueNetwork, self).__init__()
+        super(CriticNetwork, self).__init__()
         self.layer1 = nn.Linear(input_size, 128)
         self.act1 = nn.ReLU()
         self.layer2 = nn.Linear(128, 64)
@@ -40,14 +42,14 @@ class ValueNetwork(nn.Module):
 
 
 # static map from lecture:
-type_of_map = -1
-obs_size = 3  # size of observable area e.g 3x3
-if_cross = True  # observable area is cross-shaped e.g agent see only vertical and horizontal neighbouring cells
+# type_of_map = -1
+# obs_size = 3  # size of observable area e.g 3x3
+# if_cross = True  # observable area is cross-shaped e.g agent see only vertical and horizontal neighbouring cells
 
 # other static map:
-# type_of_map = -2
-# obs_size = 3          # size of observable area e.g 3x3
-# if_cross = False      # squared observable area
+type_of_map = -2
+obs_size = 3          # size of observable area e.g 3x3
+if_cross = False      # squared observable area
 
 # # random map: middle:
 # type_of_map = 0
@@ -75,18 +77,18 @@ def my_action(strategy, observation):
 
 
 def animat_train(type_of_map, obs_size=3, if_cross=False):
-    gamma = 0.98  # can be changed in training and test for the same value
+    gamma = 1  # can be changed in training and test for the same value
     lr = 0.001
-    number_of_episodes = 1000
+    number_of_episodes = 200
 
     # Initialize policy network and optimizer
     input_size = obs_size**2
-    policy_net = PolicyNetwork(input_size)
-    value_net = ValueNetwork(input_size)
-    policy_optimizer = torch.optim.Adam(policy_net.parameters(), lr=lr)
-    value_optimizer = torch.optim.Adam(value_net.parameters(), lr=lr)
+    actor_net = ActorNetwork(input_size)
+    critic_net = CriticNetwork(input_size)
+    actor_optimizer = torch.optim.Adam(actor_net.parameters(), lr=lr)
+    critic_optimizer = torch.optim.Adam(critic_net.parameters(), lr=lr)
 
-    losses = {"policy": [], "value": []}
+    losses = {"actor": [], "critic": []}
 
     for epi in range(number_of_episodes):
         map = afun.generate_map(
@@ -101,7 +103,8 @@ def animat_train(type_of_map, obs_size=3, if_cross=False):
         sum_of_discounted_rewards = 0
         cumulated_gamma = 1
 
-        trajectories = []
+        actor_epi_loss = []
+        critic_epi_loss = []
 
         while not if_end:
             step_number += 1
@@ -109,10 +112,33 @@ def animat_train(type_of_map, obs_size=3, if_cross=False):
             observation = afun.observable_region(
                 map, obs_size, position, if_cross
             ).flatten()
-            action = my_action(policy_net, observation)
+            action = my_action(actor_net, observation)
             new_position, reward = afun.transition_and_reward(map, position, action)
 
-            trajectories.append((observation, action, reward))
+            observation_tensor = torch.tensor(observation, dtype=torch.float32)
+            value = critic_net(observation_tensor)
+
+            next_observation = afun.observable_region(
+                map, obs_size, new_position, if_cross
+            ).flatten()
+            next_value = critic_net(torch.tensor(next_observation, dtype=torch.float32))
+
+            td_error = reward + gamma * next_value - value
+
+            action_probs = actor_net(observation_tensor)
+            log_prob = torch.log(action_probs[action])
+            actor_loss = -log_prob * td_error.detach() * cumulated_gamma
+
+            actor_optimizer.zero_grad()
+            actor_loss.backward()
+            actor_optimizer.step()
+
+            # critic_loss = td_error.pow(2).mean()
+            critic_loss = td_error.pow(2)
+            # critic_loss = (next_value - value).pow(2).mean()
+            critic_optimizer.zero_grad()
+            critic_loss.backward()
+            critic_optimizer.step()
 
             if reward > 0 or step_number > max_num_of_steps:
                 if_end = True
@@ -121,48 +147,24 @@ def animat_train(type_of_map, obs_size=3, if_cross=False):
             sum_of_discounted_rewards += reward * cumulated_gamma
             cumulated_gamma *= gamma
 
-        observations, actions, rewards = zip(*trajectories)
-        returns = []
-        G = 0
-        for reward in reversed(rewards):
-            G = reward + gamma * G
-            returns.insert(0, G)
-
-        returns = torch.tensor(returns, dtype=torch.float32)
-        observations = torch.tensor(observations, dtype=torch.float32)
-        values = value_net(observations).squeeze(1)
-
-        action_probs = policy_net(observations)
-        log_probs = torch.log(action_probs[range(len(actions)), actions])
-        advantage = returns - values.detach()
-
-        policy_loss = -(log_probs * advantage).mean()
-        criterion = nn.MSELoss()
-        value_loss = criterion(values, returns)
-
-        policy_optimizer.zero_grad()
-        policy_loss.backward()
-        policy_optimizer.step()
-
-        value_optimizer.zero_grad()
-        value_loss.backward()
-        value_optimizer.step()
+            actor_epi_loss.append(actor_loss.item())
+            critic_epi_loss.append(critic_loss.item())
 
         if epi % 100 == 0:
             print(f"Episode {epi}, Total Reward: {sum_of_discounted_rewards}")
 
-        losses["policy"].append(policy_loss.item())
-        losses["value"].append(value_loss.item())
+        losses["actor"].append(sum(actor_epi_loss)/len(actor_epi_loss))
+        losses["critic"].append(sum(critic_epi_loss)/len(critic_epi_loss))
 
-    plt.plot(losses["policy"], label="Policy Loss")
-    plt.plot(losses["value"], label="Value Loss")
-    plt.xlabel("Training Steps")
+    plt.plot(losses["actor"], label="Actor Loss")
+    plt.plot(losses["critic"], label="Critic Loss")
+    plt.xlabel("Episode")
     plt.ylabel("Loss")
     plt.title("Training Loss")
     plt.legend()
     plt.show()
 
-    return policy_net
+    return actor_net
 
 
 def animat_test(strategy, type_of_map, obs_size=3, if_cross=False):
